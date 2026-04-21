@@ -13,11 +13,15 @@ export default defineConfig({
       social: [
         { icon: 'github', label: 'GitHub', href: 'https://github.com/russellromney/honker' },
       ],
+      components: {
+        Header: './src/components/Header.astro',
+      },
       sidebar: [
         {
           label: 'Start here',
           items: [
-            { label: 'What is Honker?', slug: 'index' },
+            { label: 'Home', slug: 'index' },
+            { label: 'Docs overview', slug: 'docs' },
             { label: 'Getting started', slug: 'getting-started' },
           ],
         },
@@ -25,6 +29,7 @@ export default defineConfig({
           label: 'Guides',
           items: [
             { label: 'Queues', slug: 'guides/queues' },
+            { label: 'Tasks (decorators)', slug: 'guides/tasks' },
             { label: 'Streams', slug: 'guides/streams' },
             { label: 'Pub/Sub', slug: 'guides/pubsub' },
             { label: 'Scheduler', slug: 'guides/scheduler' },

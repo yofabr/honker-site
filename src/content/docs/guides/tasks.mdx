@@ -1,0 +1,112 @@
+---
+title: Tasks (decorators)
+description: Huey-style @task decorators on top of honker queues.
+---
+
+Decorators let you write queue code that looks synchronous:
+
+```python
+import honker
+
+db = honker.open("app.db")
+q = db.queue("default")
+
+@q.task(retries=3, timeout_s=30)
+def send_email(to: str, subject: str) -> dict:
+    ...
+    return {"sent_at": time.time()}
+
+# Caller side
+r = send_email("alice@example.com", "Hi")   # enqueues, returns TaskResult
+r.get(timeout=10)                            # blocks until worker finishes
+# Or: await r.aget(timeout=10)
+```
+
+Calling `send_email(...)` does NOT run the function. It JSON-encodes the args into a job payload, enqueues on the `default` queue, and returns a `TaskResult` wrapping the job id.
+
+A worker picks it up, runs the original function, stores the return value. The caller's `r.get()` reads that stored value when the worker is done.
+
+## Auto-naming and the rename footgun
+
+The default task name is `f"{fn.__module__}.{fn.__qualname__}"` — matches Huey/Celery.
+
+If you rename the function, old jobs still reference the old name. They'll dead-letter with `unknown task: myapp.send_email`. Two safe-rename patterns:
+
+1. **Explicit name from day one**: `@q.task(name="send-email")`. Rename the Python function freely; the task name is stable.
+2. **Stub the old name**: keep a wrapper under the old `@q.task(name="myapp.old_name")` that calls the new function.
+
+Docs recommend pattern 1.
+
+## Worker
+
+The worker loop dispatches by name via a process-global registry. Two ways to run it:
+
+### CLI
+
+```bash
+python -m honker worker myapp.tasks:db --queue=default --concurrency=4
+```
+
+The positional argument is an import path (`myapp.tasks`) followed by `:variable_name` — `db` is the `honker.Database` instance. Importing that module fires the `@q.task()` decorators as a side effect, populating the registry.
+
+Flags:
+- `--queue NAME` — repeat to drain multiple queues. Default: every queue with registered tasks.
+- `--concurrency N` — workers per queue. Default: `os.cpu_count()`.
+- `--list` — print registered tasks and exit.
+
+### In-process
+
+For embedding a worker inside an existing async process (FastAPI lifespan, a long-running script):
+
+```python
+import asyncio
+import honker
+
+db = honker.open("app.db")
+
+# ... @q.task-decorated functions imported and registered here ...
+
+asyncio.run(db.run_workers(concurrency=4))
+```
+
+`db.run_workers` blocks until the passed `stop_event` is set or the task is cancelled.
+
+## Defaults
+
+- **Result storage: on, 1h TTL.** `r.get()` works out of the box. Pass `store_result=False` on a decorator for fire-and-forget tasks (logs, webhook posts, cleanup) to skip the extra INSERT.
+- **Retries: inherited from the queue's `max_attempts`.** Override per-task with `@q.task(retries=N)`.
+- **Retry delay: 60s.** Override with `retry_delay_s=`.
+- **Timeout: none.** `@q.task(timeout_s=30)` wraps the call in `asyncio.wait_for`. On timeout, the job retries with `timeout after 30s` as the error. For sync functions, the task dispatches onto a background thread so a blocking task doesn't freeze peer workers.
+
+## Periodic tasks
+
+```python
+from honker import crontab
+
+@q.periodic_task(crontab("0 3 * * *"))
+def nightly_backup():
+    ...
+```
+
+Registers the function in the task registry AND in the scheduler. The scheduler enqueues a fixed payload (no args) on each cron boundary; the worker picks it up and dispatches through the same decorator-task path.
+
+Same default-on-none / explicit-name pattern: `@q.periodic_task(crontab, name="nightly")` to stabilize the name.
+
+## Edge cases
+
+**Arguments must be JSON-serializable.** Raw ints, strs, floats, bools, None, lists, and dicts. Passing a `datetime` raises `TypeError` at enqueue time — honest, not silent garbage in the payload.
+
+**Unknown task names go to dead-letter** with `unknown task: foo.bar. Registered tasks: [...]` so the operator can see what the worker has vs. what was queued.
+
+**Sync task blocking the event loop.** A sync def is dispatched onto `asyncio.to_thread` — multiple sync tasks run in parallel threads, the event loop stays responsive.
+
+**Hot reload / same-function re-register.** Calling the decorator twice on the same function is idempotent. Registering two *different* functions under the same explicit `name=` raises at import time.
+
+## What's stored where
+
+- `_honker_live` — pending + in-flight job rows. Payload is a JSON envelope: `{"__honker_task__": {"task": "...", "args": [...], "kwargs": {...}}}`.
+- `_honker_dead` — exhausted retries + unknown tasks + explicit `.fail(...)` calls.
+- `_honker_results` — return values keyed by job id. Expires at `unixepoch() + result_ttl_s`.
+- `_honker_scheduler_tasks` — periodic task registrations (one row per decorated `@periodic_task`).
+
+All tables share the same `.db` file as your business data.

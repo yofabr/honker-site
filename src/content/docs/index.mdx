@@ -3,43 +3,28 @@ title: Honker
 description: Durable queues, streams, pub/sub, and scheduler on SQLite. One file, zero servers.
 template: splash
 hero:
-  tagline: Durable queues, streams, pub/sub, and scheduler — on SQLite. One file, zero servers.
+  tagline: Durable queues, streams, pub/sub, and a cron scheduler — inside your SQLite file.
   actions:
-    - text: Get started
-      link: /getting-started/
+    - text: Read the docs
+      link: /docs/
       icon: right-arrow
       variant: primary
-    - text: View on GitHub
+    - text: GitHub
       link: https://github.com/russellromney/honker
       icon: external
 ---
 
-import { Card, CardGrid, Code, Tabs, TabItem } from '@astrojs/starlight/components';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-## What you get
+honker adds Postgres-style `NOTIFY`/`LISTEN` semantics to SQLite, with a durable pub/sub, task queue, and event streams on the side, without client polling or a daemon/broker. Cross-process wake latency is ~0.7 ms p50 on an M-series laptop.
 
-<CardGrid>
-  <Card title="Queues" icon="list-format">
-    Durable FIFO / priority job queues with visibility timeouts, retries, dead-letter, and exactly-once batch claim.
-  </Card>
-  <Card title="Streams" icon="random">
-    Durable pub/sub with per-consumer offsets. Replay after disconnect; amortized offset saves.
-  </Card>
-  <Card title="Pub/Sub" icon="comment">
-    `pg_notify`-style LISTEN/NOTIFY with 1–2 ms cross-process wake latency.
-  </Card>
-  <Card title="Scheduler" icon="forward-slash">
-    Cron-style periodic tasks with leader election, missed-boundary catch-up, and persistent state.
-  </Card>
-  <Card title="Results, Locks, Rate limits" icon="approve-check">
-    Typed task results, named advisory locks with TTL, and fixed-window rate limiting — all one SQL call away.
-  </Card>
-  <Card title="Any language" icon="seti:default">
-    Load the extension in any SQLite client. First-class bindings for Python and Node; Go, Ruby, Rust on the way.
-  </Card>
-</CardGrid>
+In its basic form it's a plain SQLite loadable extension, so any language that can `SELECT load_extension('honker_ext')` gets the same queue, streams, and notifications on the same file. Bindings for Python, Node, Rust, Go, Ruby, Bun, and Elixir share one on-disk format.
 
-## 20 seconds of code
+SQLite is backing real work now — Bluesky's PDS, Fly's LiteFS, Turso, weekend projects that somehow ended up in production. Once real work flows through a SQLite-backed app, you need a queue. The usual answer is "add Redis + Celery." That works, but introduces a second datastore with its own backup story, a dual-write problem between your business table and the queue, and the operational overhead of running a broker.
+
+honker takes the approach that if SQLite is the primary datastore, the queue should live in the same file. That means `INSERT INTO orders` and `queue.enqueue(...)` commit in the same transaction. Rollback drops both. The queue is just rows in a table with a partial index.
+
+## One example
 
 <Tabs syncKey="language">
   <TabItem label="Python">
@@ -49,20 +34,27 @@ import honker
 db = honker.open("app.db")
 q = db.queue("emails")
 
-# Enqueue (atomic with your business write)
+# Enqueue atomically with the business write — one SQLite transaction.
 with db.transaction() as tx:
     tx.execute("INSERT INTO orders (id, total) VALUES (?, ?)", [42, 99])
     q.enqueue({"to": "alice@example.com", "order_id": 42}, tx=tx)
 
-# Worker in another process
-import asyncio
+# Worker — wakes on WAL commit, no polling.
+async for job in q.claim("worker-1"):
+    await send_email(job.payload)
+    job.ack()
+```
 
-async def main():
-    async for job in q.claim("worker-1"):
-        await send_email(job.payload)
-        job.ack()
+Or with Huey-style decorators:
 
-asyncio.run(main())
+```python
+@q.task(retries=3, timeout_s=30)
+def send_email(to, subject):
+    ...
+    return {"sent_at": time.time()}
+
+r = send_email("alice@example.com", "Hi")   # enqueues, returns TaskResult
+print(r.get(timeout=10))                    # blocks until worker runs it
 ```
   </TabItem>
   <TabItem label="Node">
@@ -70,47 +62,39 @@ asyncio.run(main())
 import * as honker from '@honker/node';
 
 const db = honker.open('app.db');
-const q = db.queue('emails');
 
-// Enqueue
 const tx = db.transaction();
 tx.execute('INSERT INTO orders (id, total) VALUES (?, ?)', [42, 99]);
-q.enqueue({ to: 'alice@example.com', order_id: 42 }, { tx });
+tx.query(
+  "SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?)",
+  ['emails', JSON.stringify({ to: 'alice@example.com' }), null, null, 0, 3, null],
+);
 tx.commit();
-
-// Worker
-for await (const job of q.claim('worker-1')) {
-  await sendEmail(job.payload);
-  job.ack();
-}
 ```
   </TabItem>
   <TabItem label="SQL (any language)">
 ```sql
-.load ./libhonker
+.load ./libhonker_ext
 SELECT honker_bootstrap();
 
--- Enqueue
 SELECT honker_enqueue('emails', '{"to":"alice"}', NULL, NULL, 0, 3, NULL);
-
--- Claim
 SELECT honker_claim_batch('emails', 'worker-1', 32, 300);
-
--- Ack
 SELECT honker_ack_batch('[1,2,3]', 'worker-1');
 ```
   </TabItem>
 </Tabs>
 
-## Why Honker?
+## How it works
 
-**One file.** Your queue, your streams, your cron, your app data — same SQLite file. No Redis, no RabbitMQ, no Postgres, no service mesh. Copy the file, you've got a backup.
+honker polls SQLite's `.db-wal` file via `stat(2)` every millisecond. Each commit changes the WAL mtime, and a background thread fans that tick out to every subscriber. Subscribers run `SELECT ... WHERE id > last_seen` when woken, yielding new rows. One stat thread per database regardless of subscriber count.
 
-**Cross-process, cross-language.** A FastAPI worker, a Node cron process, and a Go backfill script can all push and claim from the same queue on disk. The SQLite loadable extension ships every `honker_*` function to any client that can `.load` a shared library.
+Idle cost is one `stat(2)` per millisecond per database — no SQL, no page-cache pressure, no writer-lock contention. Listener count scales for free because the wake signal is a file stat, not a query.
 
-**Fast enough.** Cross-process wake latency 1–2 ms p50 on M-series. Tens of thousands of enqueues per second. Pinned floor tests in CI catch 10× regressions.
+The queue, stream, and pub/sub primitives are all INSERTs into tables managed by the extension. Calling `queue.enqueue(payload, tx=tx)` inside your business transaction means the job row is ACID with the `INSERT INTO orders` that preceded it. Rollback drops the job along with everything else.
 
-**Durable enough.** `BEGIN IMMEDIATE` serializes writers; `PRAGMA journal_mode=WAL` keeps readers non-blocking. SIGKILL mid-transaction leaves the DB clean — pinned by a subprocess crash-recovery test.
+## Prior art
+
+[`pg_notify`](https://www.postgresql.org/docs/current/sql-notify.html) gives you fast cross-process triggers but no retry or visibility. [Huey](https://github.com/coleifer/huey) is the SQLite-backed Python task queue honker draws the most from. [pg-boss](https://github.com/timgit/pg-boss) and [Oban](https://github.com/sorentwo/oban) are the Postgres-side gold standards. If you already run Postgres, use those.
 
 ## Install
 
@@ -125,13 +109,32 @@ pip install honker
 npm install @honker/node
 ```
   </TabItem>
-  <TabItem label="SQLite extension (any client)">
+  <TabItem label="Rust">
 ```bash
-# macOS / Linux prebuilds
-curl -LO https://github.com/russellromney/honker/releases/latest/download/libhonker-$(uname -sm | tr 'A-Z ' 'a-z-').dylib
-
-# Or build from source
+cargo add honker
+```
+  </TabItem>
+  <TabItem label="Go">
+```bash
+go get github.com/russellromney/honker-go
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```bash
+gem install honker
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+# mix.exs
+{:honker, "~> 0.1"}
+```
+  </TabItem>
+  <TabItem label="SQLite extension">
+```bash
+# Build from source — it's one crate
 cargo build --release -p honker-extension
+# → target/release/libhonker_ext.{dylib,so}
 ```
   </TabItem>
 </Tabs>

@@ -13,23 +13,26 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 pip install honker
 ```
 
-Requires Python 3.10+. The wheel ships prebuilt SQLite + Rust binaries for macOS (arm64/x86_64) and Linux (x86_64/aarch64).
+Requires Python 3.11+. The wheel bundles the Rust cdylib so you don't need a separate extension download.
   </TabItem>
   <TabItem label="Node">
 ```bash
 npm install @honker/node
 ```
 
-Requires Node 18+. The `.node` binary ships prebuilt for the same four platforms.
+Requires Node 18+. The `.node` binary is built per-platform and published by the release workflow.
   </TabItem>
   <TabItem label="SQLite extension">
+Build from source — it's one crate:
+
 ```bash
-# Prebuild for your platform from GitHub releases:
-curl -LO https://github.com/russellromney/honker/releases/latest/download/libhonker.dylib  # macOS
-curl -LO https://github.com/russellromney/honker/releases/latest/download/libhonker.so      # Linux
+git clone https://github.com/russellromney/honker
+cd honker
+cargo build --release -p honker-extension
+# → target/release/libhonker_ext.{dylib,so}
 ```
 
-Works with any SQLite client: `sqlite3` CLI, `better-sqlite3`, `rusqlite`, Go's `mattn/go-sqlite3`, Ruby's `sqlite3` gem.
+Works with any SQLite 3.9+ client: `sqlite3` CLI, `better-sqlite3`, `rusqlite`, Go's `mattn/go-sqlite3`, Ruby's `sqlite3` gem, etc. Prebuilt release artifacts are on the roadmap.
   </TabItem>
 </Tabs>
 
