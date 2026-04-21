@@ -3,14 +3,22 @@ title: Streams
 description: Durable pub/sub with per-consumer offsets.
 ---
 
-Streams are the durable cousin of pub/sub: every event is a row in `_honker_stream`, consumers track offsets, and replay-on-reconnect is built in. Use streams when you need exactly-once-ish delivery or catch-up after a disconnect; use [pub/sub](/guides/pubsub/) when you only care about live signals.
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Streams are the durable cousin of pub/sub. Every event is a row in `_honker_stream`, consumers track offsets in `_honker_stream_consumers`, and replay-on-reconnect is built in. Use streams when you want at-least-once delivery or catch-up after a disconnect. Use [pub/sub](/guides/pubsub/) when you only care about live signals and don't need history.
+
+The on-disk format is identical across bindings: a Go publisher and a Python consumer can run against the same `.db` file.
 
 ## Publish
 
+<Tabs syncKey="language">
+  <TabItem label="Python">
 ```python
+import honker
+
+db = honker.open("app.db")
 s = db.stream("orders")
 
-# One-off publish
 s.publish({"id": 42, "amount": 9900})
 
 # Atomic with a business write
@@ -18,22 +26,210 @@ with db.transaction() as tx:
     tx.execute("INSERT INTO orders VALUES (?, ?)", [42, 9900])
     s.publish({"id": 42, "amount": 9900}, tx=tx)
 ```
+  </TabItem>
+  <TabItem label="Node">
+```js
+const lit = require('@honker/node');
+const db = lit.open('app.db');
+
+// honker_stream_publish(topic, payload_json) returns the new offset.
+const tx = db.transaction();
+tx.query(
+  "SELECT honker_stream_publish(?, ?)",
+  ['orders', JSON.stringify({ id: 42, amount: 9900 })],
+);
+tx.commit();
+```
+  </TabItem>
+  <TabItem label="Rust">
+```rust
+use honker::Database;
+use serde_json::json;
+
+let db = Database::open("app.db")?;
+let s = db.stream("orders");
+
+s.publish(&json!({"id": 42, "amount": 9900}))?;
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+import honker "github.com/russellromney/honker-go"
+
+db, _ := honker.Open("app.db", "./libhonker_ext.dylib")
+defer db.Close()
+
+s := db.Stream("orders")
+s.Publish(map[string]any{"id": 42, "amount": 9900})
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+require "honker"
+
+db = Honker::Database.new("app.db", extension_path: "./libhonker_ext.dylib")
+s = db.stream("orders")
+
+s.publish({id: 42, amount: 9900})
+```
+  </TabItem>
+  <TabItem label="Bun">
+```ts
+import { open } from "honker-bun";
+
+const db = open("app.db", "./libhonker_ext.dylib");
+const s = db.stream("orders");
+
+s.publish({ id: 42, amount: 9900 });
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+{:ok, db} = Honker.open("app.db", extension_path: "./libhonker_ext.dylib")
+
+Honker.Stream.publish(db, "orders", %{id: 42, amount: 9900})
+```
+  </TabItem>
+  <TabItem label="SQL (extension)">
+```sql
+.load ./libhonker_ext
+SELECT honker_bootstrap();
+
+-- Returns the assigned offset (monotonic within a topic).
+SELECT honker_stream_publish('orders', '{"id":42,"amount":9900}');
+```
+  </TabItem>
+</Tabs>
 
 ## Subscribe with auto-offset-save
 
 A named consumer resumes where it left off. The iterator amortizes offset saves across events so the single-writer slot doesn't thrash.
 
+<Tabs syncKey="language">
+  <TabItem label="Python">
 ```python
 async for event in s.subscribe(consumer="email-worker"):
     await send_order_email(event.payload)
-    # offset auto-saves on a cadence (default: every 1000 events or 1 second)
+    # Offset auto-saves on a cadence (default: every 1000 events or 1 second).
 ```
+  </TabItem>
+  <TabItem label="Node">
+```js
+// Poll-based read; node binding doesn't yet wrap an async iterator.
+const ev = db.walEvents();
+let offset = getSavedOffset(db, 'orders', 'email-worker'); // small SELECT
+while (running) {
+  const tx = db.transaction();
+  const rowsJson = tx.query(
+    "SELECT honker_stream_read(?, ?, ?) AS j",
+    ['orders', offset, 100],
+  )[0].j;
+  tx.commit();
+
+  const rows = JSON.parse(rowsJson);
+  if (rows.length === 0) { await ev.next(); continue; }
+
+  for (const row of rows) {
+    await sendOrderEmail(JSON.parse(row.payload));
+    offset = row.offset;
+  }
+  const stx = db.transaction();
+  stx.query(
+    "SELECT honker_stream_save_offset(?, ?, ?)",
+    ['orders', 'email-worker', offset],
+  );
+  stx.commit();
+}
+```
+  </TabItem>
+  <TabItem label="Rust">
+```rust
+loop {
+    let batch = s.read_from_consumer("email-worker", 100)?;
+    if batch.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        continue;
+    }
+    for event in &batch {
+        send_order_email(&event.payload)?;
+    }
+    s.save_offset("email-worker", batch.last().unwrap().offset)?;
+}
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+for {
+    batch, _ := s.ReadFromConsumer("email-worker", 100)
+    if len(batch) == 0 {
+        time.Sleep(100 * time.Millisecond)
+        continue
+    }
+    for _, event := range batch {
+        sendOrderEmail(event.Payload)
+    }
+    s.SaveOffset("email-worker", batch[len(batch)-1].Offset)
+}
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+loop do
+  batch = s.read_from_consumer("email-worker", 100)
+  if batch.empty?
+    sleep 0.1
+    next
+  end
+  batch.each { |event| send_order_email(event.payload) }
+  s.save_offset("email-worker", batch.last.offset)
+end
+```
+  </TabItem>
+  <TabItem label="Bun">
+```ts
+while (running) {
+  const batch = s.readFromConsumer("email-worker", 100);
+  if (batch.length === 0) { await Bun.sleep(100); continue; }
+  for (const event of batch) await sendOrderEmail(event.payload);
+  s.saveOffset("email-worker", batch[batch.length - 1].offset);
+}
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+loop = fn loop ->
+  case Honker.Stream.read_from_consumer(db, "orders", "email-worker", 100) do
+    {:ok, []} ->
+      :timer.sleep(100)
+      loop.(loop)
+    {:ok, batch} ->
+      Enum.each(batch, fn e -> send_order_email(e.payload) end)
+      last = List.last(batch)
+      Honker.Stream.save_offset(db, "orders", "email-worker", last.offset)
+      loop.(loop)
+  end
+end
+loop.(loop)
+```
+  </TabItem>
+  <TabItem label="SQL (extension)">
+```sql
+-- Read up to 100 events after the consumer's saved offset.
+-- Returns a JSON array: [{"offset": ..., "payload": ..., "ts": ...}, ...]
+SELECT honker_stream_read_from_consumer('orders', 'email-worker', 100);
+
+-- Save the consumer's offset after processing.
+SELECT honker_stream_save_offset('orders', 'email-worker', 42);
+```
+  </TabItem>
+</Tabs>
 
 ## Manual offset control
 
-For exactly-once-within-a-business-transaction semantics, save the offset inside the same transaction as your business write:
+For exactly-once-within-a-business-transaction semantics, save the offset in the same transaction as the downstream write. If the transaction rolls back, the offset doesn't advance and the event replays on the next read.
 
 ```python
+# Python
 async for event in s.subscribe(
     consumer="invariant-writer",
     save_every_n=0,  # disable auto-save
@@ -44,13 +240,15 @@ async for event in s.subscribe(
         s.save_offset("invariant-writer", event.offset, tx=tx)
 ```
 
+Other bindings do the same by passing the `tx` handle into `save_offset`. The extension-level SQL calls (`honker_stream_save_offset`) already run inside whatever transaction is open, so this pattern works uniformly across languages.
+
 ## Replay semantics
 
-- `subscribe(consumer=name)` — start from the saved offset for this consumer (0 if never saved).
-- `subscribe(from_offset=N)` — start after offset N, regardless of any saved offset.
-- `subscribe()` — start from the current `MAX(offset)` (live-tail, no replay).
+- `subscribe(consumer=name)` starts from the saved offset for this consumer (0 if never saved).
+- `subscribe(from_offset=N)` starts after offset N, regardless of any saved offset.
+- `subscribe()` starts from the current `MAX(offset)` for live-tail with no replay.
 
 ## Where it lives
 
-- `_honker_stream` — append-only event log. `(topic, offset)` partial index for O(log n) reads.
-- `_honker_stream_consumers` — `(name, topic) -> offset`. One row per consumer per topic.
+- `_honker_stream` is the append-only event log. A `(topic, offset)` partial index keeps reads O(log n) even with millions of historical events.
+- `_honker_stream_consumers` stores `(name, topic) -> offset`. One row per consumer per topic.

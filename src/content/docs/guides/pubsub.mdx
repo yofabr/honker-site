@@ -1,54 +1,192 @@
 ---
 title: Pub/Sub
-description: pg_notify-style ephemeral LISTEN/NOTIFY with 1–2 ms cross-process wake latency.
+description: pg_notify-style ephemeral LISTEN/NOTIFY with 1-2 ms cross-process wake latency.
 ---
 
-Honker's pub/sub is a direct analog of Postgres's `pg_notify` / `LISTEN`: fire-and-forget signals between processes that share a SQLite file. 1–2 ms cross-process wake latency on M-series laptops. No replay, no delivery guarantees — for that use [Streams](/guides/streams/).
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Honker's pub/sub is a direct analog of Postgres's `pg_notify` / `LISTEN`: fire-and-forget signals between processes that share a SQLite file. 1-2 ms cross-process wake latency on M-series laptops. No replay, no delivery guarantees. For that, use [Streams](/guides/streams/).
+
+The wire format is the same across bindings: a Python publisher and a Go listener talk to the same channel through the same `.db` file.
 
 ## Fire a signal
 
+<Tabs syncKey="language">
+  <TabItem label="Python">
 ```python
+import honker
+
+db = honker.open("app.db")
+
 with db.transaction() as tx:
     tx.notify("orders", {"id": 42, "event": "placed"})
 ```
 
-The notification commits with the surrounding transaction. If the tx rolls back, no one receives the notification.
+The notification commits with the surrounding transaction. If the tx rolls back, no one receives it.
+  </TabItem>
+  <TabItem label="Node">
+```js
+const lit = require('@honker/node');
+const db = lit.open('app.db');
+
+const tx = db.transaction();
+tx.query(
+  "SELECT notify(?, ?)",
+  ['orders', JSON.stringify({ id: 42, event: 'placed' })],
+);
+tx.commit();
+```
+  </TabItem>
+  <TabItem label="Rust">
+```rust
+use honker::Database;
+use serde_json::json;
+
+let db = Database::open("app.db")?;
+db.notify("orders", &json!({"id": 42, "event": "placed"}))?;
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+import honker "github.com/russellromney/honker-go"
+
+db, _ := honker.Open("app.db", "./libhonker_ext.dylib")
+defer db.Close()
+
+db.Notify("orders", map[string]any{"id": 42, "event": "placed"})
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+require "honker"
+
+db = Honker::Database.new("app.db", extension_path: "./libhonker_ext.dylib")
+db.notify("orders", {id: 42, event: "placed"})
+```
+  </TabItem>
+  <TabItem label="Bun">
+```ts
+import { open } from "honker-bun";
+
+const db = open("app.db", "./libhonker_ext.dylib");
+db.notify("orders", { id: 42, event: "placed" });
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+{:ok, db} = Honker.open("app.db", extension_path: "./libhonker_ext.dylib")
+Honker.notify(db, "orders", %{id: 42, event: "placed"})
+```
+  </TabItem>
+  <TabItem label="SQL (extension)">
+```sql
+.load ./libhonker_ext
+SELECT honker_bootstrap();
+
+-- Matches pg_notify's signature for drop-in familiarity.
+SELECT notify('orders', '{"id":42,"event":"placed"}');
+```
+  </TabItem>
+</Tabs>
 
 ## Listen
 
+The listener starts from `MAX(id)` at attach time. Historical notifications are not replayed. Honker uses a shared stat-poll thread on the `.db-wal` file with a 1 ms cadence, so every listener in the process wakes on any WAL commit and then filters by channel at the `SELECT` level.
+
+<Tabs syncKey="language">
+  <TabItem label="Python">
 ```python
 async for notif in db.listen("orders"):
     print(notif.channel, notif.payload)
 ```
+  </TabItem>
+  <TabItem label="Node">
+```js
+const ev = db.walEvents();
+let lastId = db.transaction()
+  .query("SELECT COALESCE(MAX(id), 0) AS m FROM _honker_notifications")[0].m;
 
-The listener:
-- Starts from `MAX(id)` at attach time. Historical notifications are not replayed.
-- Wakes on every `.db-wal` change via a shared stat-poll thread (1 ms cadence).
-- Filters by channel at the SELECT level — a busy unrelated channel doesn't slow you down.
+while (running) {
+  const tx = db.transaction();
+  const rows = tx.query(
+    "SELECT id, channel, payload FROM _honker_notifications WHERE id > ? AND channel = ? ORDER BY id",
+    [lastId, 'orders'],
+  );
+  tx.commit();
+
+  if (rows.length === 0) { await ev.next(); continue; }
+  for (const r of rows) {
+    console.log(r.channel, JSON.parse(r.payload));
+    lastId = r.id;
+  }
+}
+```
+  </TabItem>
+  <TabItem label="Rust">
+```rust
+// Blocking iterator; async wrapper is on the roadmap.
+for notif in db.listen("orders")? {
+    let notif = notif?;
+    println!("{} {}", notif.channel, notif.payload);
+}
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+sub, _ := db.Listen("orders")
+defer sub.Close()
+
+for notif := range sub.Channel() {
+    fmt.Println(notif.Channel, string(notif.Payload))
+}
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+db.listen("orders") do |notif|
+  puts "#{notif.channel} #{notif.payload}"
+end
+```
+  </TabItem>
+  <TabItem label="Bun">
+```ts
+for await (const notif of db.listen("orders")) {
+  console.log(notif.channel, notif.payload);
+}
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+{:ok, sub} = Honker.listen(db, "orders")
+
+receive_loop = fn loop ->
+  receive do
+    {:honker_notification, notif} ->
+      IO.inspect({notif.channel, notif.payload})
+      loop.(loop)
+  end
+end
+receive_loop.(receive_loop)
+```
+  </TabItem>
+</Tabs>
 
 ## Cross-process
 
-The WAL watcher fires on commits from *any* process. A FastAPI app, a CLI worker, and a cron job can all `notify()` the same channel and a separate listener receives them all within a few milliseconds.
-
-## From raw SQLite
-
-Load the extension from any SQLite client and the `notify()` function is there:
-
-```sql
-.load ./libhonker
-SELECT notify('orders', '{"id":42}');
-```
-
-The extension keeps the function name `notify(channel, payload)` — matching `pg_notify`'s signature for drop-in familiarity.
+The WAL watcher fires on commits from *any* process. A FastAPI app, a CLI worker, and a cron job can all `notify()` the same channel, and a separate listener receives every signal within a few milliseconds. No coordination, no broker, no extra network hop.
 
 ## Pruning
 
-Notifications accumulate in `_litenotify_notifications` until you prune them. There's no auto-prune because "how much history do you want" is a product decision.
+Notifications accumulate in `_honker_notifications` until you prune them. There's no auto-prune because "how much history do you want" is a product decision. Honker exposes two prune modes, available from any binding.
 
 ```python
-# Delete rows older than 1 hour
-db.prune_notifications(older_than_s=3600)
+# Python
+db.prune_notifications(older_than_s=3600)   # delete rows older than 1 hour
+db.prune_notifications(max_keep=10_000)     # keep only the most recent 10k
+```
 
-# Keep only the most recent 10k rows
-db.prune_notifications(max_keep=10_000)
+```sql
+-- From SQL
+SELECT honker_prune_notifications_older_than(3600);
+SELECT honker_prune_notifications_keep_latest(10000);
 ```

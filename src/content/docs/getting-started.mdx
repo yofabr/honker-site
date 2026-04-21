@@ -13,17 +13,67 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 pip install honker
 ```
 
-Requires Python 3.11+. The wheel bundles the Rust cdylib so you don't need a separate extension download.
+Requires Python 3.11+. The wheel bundles the Rust cdylib so you don't need a separate extension download. macOS (arm64, x86_64) and Linux (x86_64, aarch64) wheels are published.
   </TabItem>
   <TabItem label="Node">
 ```bash
 npm install @honker/node
 ```
 
-Requires Node 18+. The `.node` binary is built per-platform and published by the release workflow.
+Requires Node 18+. The `.node` native binary is built per-platform by the release workflow. No separate extension download needed on supported targets (macOS arm64/x86_64, Linux x86_64/aarch64, Windows x86_64).
+  </TabItem>
+  <TabItem label="Rust">
+```toml
+# Cargo.toml
+[dependencies]
+honker = "0.1"
+serde_json = "1"
+```
+
+The `honker` crate pulls in `honker-core` and `honker-extension`. SQLite is vendored by default via `rusqlite`; opt out with `default-features = false` if you want to link against a system SQLite.
+  </TabItem>
+  <TabItem label="Go">
+```bash
+go get github.com/russellromney/honker-go
+```
+
+Requires Go 1.21+. The Go binding calls into the extension via `mattn/go-sqlite3`, so you also need the compiled `libhonker_ext.{dylib,so,dll}` on disk. Grab it from the release page or build it yourself (see the SQLite extension tab).
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+# Gemfile
+gem "honker"
+```
+
+```bash
+bundle install
+```
+
+Requires Ruby 3.2+. Uses the `sqlite3` gem under the hood. As with Go, Ruby points at a prebuilt `libhonker_ext.{dylib,so}` for the extension.
+  </TabItem>
+  <TabItem label="Bun">
+```bash
+bun add honker-bun
+```
+
+Requires Bun 1.1+. Uses `bun:sqlite` and loads the extension from `./libhonker_ext.{dylib,so}`. Prebuilt extension binaries are attached to each GitHub release.
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+# mix.exs
+def deps do
+  [{:honker, "~> 0.1"}]
+end
+```
+
+```bash
+mix deps.get
+```
+
+Requires Elixir 1.15+ and Erlang/OTP 26+. Uses `exqlite` for the SQLite FFI and loads the extension from a configured path.
   </TabItem>
   <TabItem label="SQLite extension">
-Build from source — it's one crate:
+Build from source. It's one crate:
 
 ```bash
 git clone https://github.com/russellromney/honker
@@ -32,27 +82,24 @@ cargo build --release -p honker-extension
 # → target/release/libhonker_ext.{dylib,so}
 ```
 
-Works with any SQLite 3.9+ client: `sqlite3` CLI, `better-sqlite3`, `rusqlite`, Go's `mattn/go-sqlite3`, Ruby's `sqlite3` gem, etc. Prebuilt release artifacts are on the roadmap.
+Works with any SQLite 3.9+ client: `sqlite3` CLI, `better-sqlite3`, `rusqlite`, Go's `mattn/go-sqlite3`, Ruby's `sqlite3` gem, Elixir's `exqlite`, and so on. Prebuilt release artifacts for macOS and Linux are attached to each GitHub release.
   </TabItem>
 </Tabs>
 
 ## Your first queue
 
-Open a database, create a queue, enqueue a job, and claim it — all in one script.
+Open a database, create a queue, enqueue a job, and claim it, all in one script.
 
 <Tabs syncKey="language">
   <TabItem label="Python">
 ```python
 import honker
 
-# Opens or creates the DB file. Everything lives in one .db file.
-db = honker.open("app.db")
+db = honker.open("app.db")        # opens or creates the file
 q = db.queue("greetings")
 
-# Enqueue a job
 q.enqueue({"name": "world"})
 
-# Claim + ack
 job = q.claim_one("worker-1")
 print(f"hello, {job.payload['name']}!")
 job.ack()
@@ -60,23 +107,122 @@ job.ack()
   </TabItem>
   <TabItem label="Node">
 ```js
-import * as honker from '@honker/node';
+const lit = require('@honker/node');
+const db = lit.open('app.db');
 
-const db = honker.open('app.db');
-const q = db.queue('greetings');
+const tx = db.transaction();
+tx.query("SELECT honker_bootstrap()");
+tx.query(
+  "SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?)",
+  ['greetings', JSON.stringify({ name: 'world' }), null, null, 0, 3, null],
+);
+tx.commit();
 
-q.enqueue({ name: 'world' });
+const rtx = db.transaction();
+const jobs = JSON.parse(
+  rtx.query(
+    "SELECT honker_claim_batch(?, ?, ?, ?) AS j",
+    ['greetings', 'worker-1', 1, 300],
+  )[0].j,
+);
+rtx.commit();
 
-const job = q.claimOne('worker-1');
-console.log(`hello, ${job.payload.name}!`);
+const job = jobs[0];
+console.log(`hello, ${JSON.parse(job.payload).name}!`);
+
+const atx = db.transaction();
+atx.query(
+  "SELECT honker_ack_batch(?, ?)",
+  [JSON.stringify([job.id]), job.worker_id],
+);
+atx.commit();
+```
+  </TabItem>
+  <TabItem label="Rust">
+```rust
+use honker::{Database, QueueOpts, EnqueueOpts};
+use serde_json::json;
+
+let db = Database::open("app.db")?;
+let q = db.queue("greetings", QueueOpts::default());
+
+q.enqueue(&json!({"name": "world"}), EnqueueOpts::default())?;
+
+if let Some(job) = q.claim_one("worker-1")? {
+    println!("hello, {}!", job.payload["name"]);
+    job.ack()?;
+}
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+package main
+
+import (
+    "fmt"
+    honker "github.com/russellromney/honker-go"
+)
+
+func main() {
+    db, _ := honker.Open("app.db", "./libhonker_ext.dylib")
+    defer db.Close()
+
+    q := db.Queue("greetings", honker.QueueOptions{})
+    q.Enqueue(map[string]any{"name": "world"}, honker.EnqueueOptions{})
+
+    job, _ := q.ClaimOne("worker-1")
+    var p map[string]any
+    job.UnmarshalPayload(&p)
+    fmt.Printf("hello, %s!\n", p["name"])
+    job.Ack()
+}
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+require "honker"
+
+db = Honker::Database.new("app.db", extension_path: "./libhonker_ext.dylib")
+q = db.queue("greetings")
+
+q.enqueue({name: "world"})
+
+job = q.claim_one("worker-1")
+puts "hello, #{job.payload[:name]}!"
+job.ack
+```
+  </TabItem>
+  <TabItem label="Bun">
+```ts
+import { open } from "honker-bun";
+
+const db = open("app.db", "./libhonker_ext.dylib");
+const q = db.queue("greetings");
+
+q.enqueue({ name: "world" });
+
+const job = q.claimOne("worker-1")!;
+console.log(`hello, ${(job.payload as { name: string }).name}!`);
 job.ack();
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+{:ok, db} = Honker.open("app.db", extension_path: "./libhonker_ext.dylib")
+q = Honker.queue(db, "greetings")
+
+Honker.Queue.enqueue(q, %{name: "world"})
+
+{:ok, job} = Honker.Queue.claim_one(q, "worker-1")
+IO.puts("hello, #{job.payload["name"]}!")
+Honker.Job.ack(db, job)
 ```
   </TabItem>
 </Tabs>
 
 ## A proper worker
 
-The worker loop waits on the DB's write-ahead log and wakes within 1–2 ms when a new job lands. No polling.
+The worker loop waits on the database's write-ahead log and wakes within 1-2 ms when a new job lands. No polling.
 
 <Tabs syncKey="language">
   <TabItem label="Python">
@@ -100,28 +246,92 @@ async def main():
 asyncio.run(main())
 ```
   </TabItem>
-  <TabItem label="Node">
-```js
-import * as honker from '@honker/node';
-
-const db = honker.open('app.db');
-const q = db.queue('emails');
-
-for await (const job of q.claim('worker-1')) {
+  <TabItem label="Rust">
+```rust
+loop {
+    if let Some(job) = q.claim_one("worker-1")? {
+        match send_email(&job.payload) {
+            Ok(_)  => { job.ack()?; }
+            Err(e) => { job.retry(60, &e.to_string())?; }
+        }
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+for {
+    job, _ := q.ClaimOne("worker-1")
+    if job == nil {
+        time.Sleep(100 * time.Millisecond)
+        continue
+    }
+    var p map[string]any
+    job.UnmarshalPayload(&p)
+    if err := sendEmail(p); err != nil {
+        job.Retry(60, err.Error())
+    } else {
+        job.Ack()
+    }
+}
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+loop do
+  job = q.claim_one("worker-1")
+  if job.nil?
+    sleep 0.1
+    next
+  end
+  begin
+    send_email(job.payload)
+    job.ack
+  rescue => e
+    job.retry(delay_s: 60, error: e.message)
+  end
+end
+```
+  </TabItem>
+  <TabItem label="Bun">
+```ts
+while (running) {
+  const job = q.claimOne("worker-1");
+  if (!job) { await Bun.sleep(100); continue; }
   try {
-    await sendEmail(job.payload);
+    await sendEmail(job.payload as { to: string });
     job.ack();
   } catch (e) {
-    job.retry({ delaySeconds: 60, error: String(e) });
+    job.retry(60, String(e));
   }
 }
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+loop = fn loop ->
+  case Honker.Queue.claim_one(q, "worker-1") do
+    {:ok, nil} -> :timer.sleep(100); loop.(loop)
+    {:ok, job} ->
+      try do
+        send_email(job.payload)
+        Honker.Job.ack(db, job)
+      rescue
+        e -> Honker.Job.retry(db, job, 60, Exception.message(e))
+      end
+      loop.(loop)
+  end
+end
+loop.(loop)
 ```
   </TabItem>
 </Tabs>
 
 ## Atomic enqueue with business writes
 
-The killer feature of a SQLite-native queue: the enqueue is in the same transaction as your business write. No dual-write problem, no outbox pattern to bolt on (though Honker has one for external systems).
+The killer feature of a SQLite-native queue: the enqueue lands in the same transaction as your business write. No dual-write problem, no outbox pattern to bolt on (though Honker has one for external systems).
 
 <Tabs syncKey="language">
   <TabItem label="Python">
@@ -132,26 +342,91 @@ with db.transaction() as tx:
         [42, 9900, "alice"],
     )
     q.enqueue({"order_id": 42, "email_type": "confirmation"}, tx=tx)
-    # One COMMIT. Either both or neither lands.
+    # One COMMIT. Either both land or neither does.
 ```
   </TabItem>
   <TabItem label="Node">
 ```js
 const tx = db.transaction();
-tx.execute(
-  'INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)',
+tx.query(
+  "INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)",
   [42, 9900, 'alice'],
 );
-q.enqueue({ order_id: 42, email_type: 'confirmation' }, { tx });
+tx.query(
+  "SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?)",
+  ['emails', JSON.stringify({ order_id: 42, email_type: 'confirmation' }),
+   null, null, 0, 3, null],
+);
 tx.commit();
+```
+  </TabItem>
+  <TabItem label="Rust">
+```rust
+let tx = db.transaction()?;
+tx.execute(
+    "INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)",
+    rusqlite::params![42, 9900, "alice"],
+)?;
+q.enqueue_tx(
+    &tx,
+    &json!({"order_id": 42, "email_type": "confirmation"}),
+    EnqueueOpts::default(),
+)?;
+tx.commit()?;
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+tx, _ := db.Begin()
+tx.Exec(
+    "INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)",
+    42, 9900, "alice",
+)
+q.EnqueueTx(tx, map[string]any{
+    "order_id":   42,
+    "email_type": "confirmation",
+}, honker.EnqueueOptions{})
+tx.Commit()
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+db.transaction do |tx|
+  tx.execute(
+    "INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)",
+    [42, 9900, "alice"],
+  )
+  q.enqueue({order_id: 42, email_type: "confirmation"}, tx: tx)
+end
+```
+  </TabItem>
+  <TabItem label="Bun">
+```ts
+const tx = db.transaction();
+tx.execute(
+  "INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)",
+  [42, 9900, "alice"],
+);
+q.enqueue({ order_id: 42, email_type: "confirmation" }, { tx });
+tx.commit();
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+Honker.transaction(db, fn tx ->
+  Honker.execute(tx, "INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)",
+    [42, 9900, "alice"])
+  Honker.Queue.enqueue(q, %{order_id: 42, email_type: "confirmation"}, tx: tx)
+end)
 ```
   </TabItem>
 </Tabs>
 
 ## What's next
 
-- [Queues](/guides/queues/) — priority, delays, retries, dead-letter
-- [Streams](/guides/streams/) — durable pub/sub with per-consumer offsets
-- [Pub/Sub](/guides/pubsub/) — `pg_notify`-style ephemeral signals
-- [Scheduler](/guides/scheduler/) — cron-style periodic tasks
-- [Extension reference](/reference/extension/) — the full `honker_*` SQL function family
+- [Queues](/guides/queues/) for priority, delays, retries, dead-letter
+- [Tasks](/guides/tasks/) for Huey-style `@task` decorators (Python)
+- [Streams](/guides/streams/) for durable pub/sub with per-consumer offsets
+- [Pub/Sub](/guides/pubsub/) for `pg_notify`-style ephemeral signals
+- [Scheduler](/guides/scheduler/) for cron-style periodic tasks
+- [Extension reference](/reference/extension/) for the full `honker_*` SQL function family

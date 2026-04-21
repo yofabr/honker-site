@@ -5,84 +5,332 @@ description: Durable FIFO / priority job queues backed by SQLite.
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-A Honker queue is a named row group in the `_honker_live` table. Jobs have a payload, a priority, a `run_at` time, an attempts counter, and (optionally) an expiration. The worker loop claims jobs atomically via an indexed `UPDATE ... RETURNING`, runs them, and acks.
+A honker queue is a named row group in the `_honker_live` table. Jobs have a payload, a priority, a `run_at` time, an attempts counter, and (optionally) an expiration. A worker claims jobs atomically via an indexed `UPDATE ... RETURNING`, runs them, and acks (which DELETEs the row).
+
+Every language binding shares the same on-disk format, so a Python enqueuer and a Go consumer can run against the same `.db` file.
 
 ## Enqueue
 
 <Tabs syncKey="language">
   <TabItem label="Python">
 ```python
+import honker
+
+db = honker.open("app.db")
 q = db.queue("emails")
 
-# Simple enqueue
 q.enqueue({"to": "alice@example.com"})
-
-# Delayed enqueue
-q.enqueue({"to": "bob@example.com"}, delay=60)  # claimable in 60s
-
-# Priority (higher = picked first within a queue)
-q.enqueue({"to": "urgent@example.com"}, priority=10)
-
-# Auto-expire uncaimed jobs after 1 hour
-q.enqueue({"to": "timely@example.com"}, expires=3600)
+q.enqueue({"to": "bob@example.com"}, delay=60)       # claimable in 60s
+q.enqueue({"to": "urgent@example.com"}, priority=10) # higher = picked first
+q.enqueue({"to": "timely@example.com"}, expires=3600) # drops out after 1h
 ```
   </TabItem>
   <TabItem label="Node">
 ```js
-const q = db.queue('emails');
+const lit = require('@honker/node');
+const db = lit.open('app.db');
 
-q.enqueue({ to: 'alice@example.com' });
-q.enqueue({ to: 'bob@example.com' }, { delay: 60 });
-q.enqueue({ to: 'urgent@example.com' }, { priority: 10 });
-q.enqueue({ to: 'timely@example.com' }, { expires: 3600 });
+// One-time: install the schema. honker.open bootstraps for you,
+// but low-level Node needs an explicit call.
+const setup = db.transaction();
+setup.query("SELECT honker_bootstrap()");
+setup.commit();
+
+// Enqueue. honker_enqueue signature:
+//   (queue, payload, run_at_or_null, delay_or_null, priority, max_attempts, expires_or_null)
+const tx = db.transaction();
+tx.query(
+  "SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?)",
+  ['emails', JSON.stringify({ to: 'alice@example.com' }), null, null, 0, 3, null],
+);
+tx.commit();
+```
+  </TabItem>
+  <TabItem label="Rust">
+```rust
+use honker::{Database, EnqueueOpts, QueueOpts};
+use serde_json::json;
+
+let db = Database::open("app.db")?;
+let q = db.queue("emails", QueueOpts::default());
+
+q.enqueue(
+    &json!({"to": "alice@example.com"}),
+    EnqueueOpts::default(),
+)?;
+q.enqueue(
+    &json!({"to": "bob@example.com"}),
+    EnqueueOpts { delay: Some(60), ..Default::default() },
+)?;
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+import honker "github.com/russellromney/honker-go"
+
+db, _ := honker.Open("app.db", "./libhonker_ext.dylib")
+defer db.Close()
+
+q := db.Queue("emails", honker.QueueOptions{})
+
+q.Enqueue(map[string]any{"to": "alice@example.com"}, honker.EnqueueOptions{})
+
+delay := int64(60)
+q.Enqueue(
+    map[string]any{"to": "bob@example.com"},
+    honker.EnqueueOptions{Delay: &delay},
+)
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+require "honker"
+
+db = Honker::Database.new("app.db", extension_path: "./libhonker_ext.dylib")
+q = db.queue("emails")
+
+q.enqueue({to: "alice@example.com"})
+q.enqueue({to: "bob@example.com"}, delay: 60)
+q.enqueue({to: "urgent@example.com"}, priority: 10)
+```
+  </TabItem>
+  <TabItem label="Bun">
+```ts
+import { open } from "honker-bun";
+
+const db = open("app.db", "./libhonker_ext.dylib");
+const q = db.queue("emails");
+
+q.enqueue({ to: "alice@example.com" });
+q.enqueue({ to: "bob@example.com" }, { delay: 60 });
+q.enqueue({ to: "urgent@example.com" }, { priority: 10 });
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+{:ok, db} = Honker.open("app.db", extension_path: "./libhonker_ext.dylib")
+
+Honker.Queue.enqueue(db, "emails", %{to: "alice@example.com"})
+Honker.Queue.enqueue(db, "emails", %{to: "bob@example.com"}, delay: 60)
+```
+  </TabItem>
+  <TabItem label="SQL (extension)">
+```sql
+.load ./libhonker_ext
+SELECT honker_bootstrap();
+
+-- honker_enqueue(queue, payload_json, run_at, delay, priority, max_attempts, expires)
+SELECT honker_enqueue('emails', '{"to":"alice"}', NULL, NULL, 0, 3, NULL);
+SELECT honker_enqueue('emails', '{"to":"bob"}', NULL, 60, 0, 3, NULL);
 ```
   </TabItem>
 </Tabs>
 
-## Claim in a worker
+## Claim and ack
 
-The async iterator wakes on every DB commit via the WAL watcher — 1–2 ms cross-process wake latency. No polling.
+Claiming moves a row to `state='processing'` and sets `claim_expires_at = unixepoch() + visibility_timeout_s`. If the worker doesn't ack before that window elapses, another worker can reclaim.
 
+<Tabs syncKey="language">
+  <TabItem label="Python">
 ```python
+# Async iterator — wakes on every WAL commit, no polling.
 async for job in q.claim("worker-1"):
     try:
-        await do_work(job.payload)
+        await send_email(job.payload)
         job.ack()
-    except Retryable as e:
-        job.retry(delay_s=e.delay_s, error=str(e))
     except Exception as e:
-        job.fail(error=str(e))  # straight to dead
+        job.retry(delay_s=60, error=str(e))
 ```
+  </TabItem>
+  <TabItem label="Node">
+```js
+// Poll-based claim; honker-node doesn't yet wrap an async iterator.
+// walEvents() gives you cross-process wake signals to drive a loop.
+const ev = db.walEvents();
+while (running) {
+  const tx = db.transaction();
+  const rowsJson = tx.query(
+    "SELECT honker_claim_batch(?, ?, ?, ?) AS j",
+    ['emails', 'worker-1', 1, 300],
+  )[0].j;
+  tx.commit();
+
+  const jobs = JSON.parse(rowsJson);
+  if (jobs.length === 0) {
+    await ev.next();  // block until the next WAL commit
+    continue;
+  }
+  const job = jobs[0];
+  try {
+    await sendEmail(JSON.parse(job.payload));
+    const atx = db.transaction();
+    atx.query("SELECT honker_ack_batch(?, ?)",
+              [JSON.stringify([job.id]), job.worker_id]);
+    atx.commit();
+  } catch (err) { /* retry via SQL */ }
+}
+```
+  </TabItem>
+  <TabItem label="Rust">
+```rust
+loop {
+    if let Some(job) = q.claim_one("worker-1")? {
+        match send_email(&job.payload) {
+            Ok(_)  => { job.ack()?; }
+            Err(e) => { job.retry(60, &e.to_string())?; }
+        }
+    } else {
+        // wait for a WAL commit or sleep; honker-rs async iterator
+        // wrapper is on the roadmap.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+for {
+    job, err := q.ClaimOne("worker-1")
+    if err != nil { log.Fatal(err) }
+    if job == nil {
+        time.Sleep(100 * time.Millisecond)
+        continue
+    }
+    var payload map[string]any
+    json.Unmarshal(job.Payload, &payload)
+    if err := sendEmail(payload); err != nil {
+        job.Retry(60, err.Error())
+    } else {
+        job.Ack()
+    }
+}
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+loop do
+  job = q.claim_one("worker-1")
+  if job.nil?
+    sleep 0.1
+    next
+  end
+  begin
+    send_email(job.payload)
+    job.ack
+  rescue => e
+    job.retry(delay_s: 60, error: e.message)
+  end
+end
+```
+  </TabItem>
+  <TabItem label="Bun">
+```ts
+while (running) {
+  const job = q.claimOne("worker-1");
+  if (!job) { await Bun.sleep(100); continue; }
+  try {
+    await sendEmail(job.payload as { to: string });
+    job.ack();
+  } catch (e) {
+    job.retry(60, String(e));
+  }
+}
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+loop = fn loop ->
+  case Honker.Queue.claim_one(db, "emails", "worker-1") do
+    {:ok, nil} ->
+      :timer.sleep(100)
+      loop.(loop)
+    {:ok, job} ->
+      try do
+        send_email(job.payload)
+        Honker.Job.ack(db, job)
+      rescue
+        e -> Honker.Job.retry(db, job, 60, Exception.message(e))
+      end
+      loop.(loop)
+  end
+end
+loop.(loop)
+```
+  </TabItem>
+  <TabItem label="SQL (extension)">
+```sql
+-- Claim up to 32 jobs with a 300-second visibility timeout.
+-- Returns a JSON array: [{"id": ..., "queue": ..., "payload": ...,
+--                         "worker_id": ..., "attempts": ...}, ...]
+SELECT honker_claim_batch('emails', 'worker-1', 32, 300);
+
+-- Ack multiple jobs (DELETEs if the claim is still valid).
+SELECT honker_ack_batch('[1,2,3]', 'worker-1');
+```
+  </TabItem>
+</Tabs>
 
 ## Batch claim
 
-If your handler benefits from batching (DB writes, HTTP calls), claim N jobs at once:
+For handlers that benefit from batching (DB writes, HTTP calls), claim N jobs in one transaction:
 
+<Tabs syncKey="language">
+  <TabItem label="Python">
 ```python
 jobs = q.claim_batch("worker-1", n=100)
 for j in jobs:
     process(j.payload)
 q.ack_batch([j.id for j in jobs], "worker-1")
 ```
+  </TabItem>
+  <TabItem label="Rust">
+```rust
+let jobs = q.claim_batch("worker-1", 100)?;
+for job in &jobs { process(&job.payload); }
+// batch ack via raw SQL; honker-rs typed wrapper coming.
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+jobs, _ := q.ClaimBatch("worker-1", 100)
+for _, j := range jobs { process(j.Payload); j.Ack() }
+// typed BatchAck is on the roadmap.
+```
+  </TabItem>
+  <TabItem label="SQL (extension)">
+```sql
+SELECT honker_claim_batch('emails', 'worker-1', 100, 300);
+-- process each row in the returned JSON
+SELECT honker_ack_batch('[1,2,...,100]', 'worker-1');
+```
+  </TabItem>
+</Tabs>
 
-## Visibility timeout & heartbeat
+## Visibility timeout and heartbeat
 
-Every claim has a `claim_expires_at` (default 300s). If the worker doesn't ack or extend the claim in time, another worker can reclaim. For long-running jobs, heartbeat:
+Every claim has a `claim_expires_at` (default 300s). If the worker doesn't ack or extend before that elapses, another worker can reclaim.
+
+For long-running jobs, call `heartbeat` periodically to extend the window:
 
 ```python
+# Python
 async for job in q.claim("worker-1"):
     async with heartbeat(job, every_s=60):
         await long_running(job.payload)
     job.ack()
 ```
 
+Other bindings expose a plain `job.heartbeat(extend_s)` that you call on a timer.
+
 ## Retry, fail, dead-letter
 
-- `job.retry(delay_s, error)` — put back in `_honker_live` with a delay. After `max_attempts`, auto-moves to `_honker_dead`.
-- `job.fail(error)` — unconditional move to `_honker_dead`.
-- Dead jobs have `last_error` set. Inspect via `SELECT * FROM _honker_dead WHERE queue = 'emails'`.
+- `job.retry(delay_s, error)` puts the row back in `_honker_live` with a new `run_at`. After `max_attempts` retries, it auto-moves to `_honker_dead`.
+- `job.fail(error)` moves it to `_honker_dead` unconditionally.
+- `_honker_dead` rows have `last_error` set; inspect with `SELECT * FROM _honker_dead WHERE queue = 'emails'`.
 
 ## Where it lives
 
-- `_honker_live` — all currently-claimable or in-flight jobs. Partial index on `(queue, priority DESC, run_at, id)` for O(log n) claims.
-- `_honker_dead` — exhausted or manually-failed jobs. Never auto-pruned; DELETE when you want.
+- `_honker_live`: all currently-claimable or in-flight jobs. Partial index on `(queue, priority DESC, run_at, id) WHERE state IN ('pending', 'processing')` for O(log n) claims.
+- `_honker_dead`: exhausted or manually-failed jobs. Never auto-pruned; DELETE when you want.
+
+A queue with 100k dead rows claims as fast as one with zero because the claim index excludes the dead state.
