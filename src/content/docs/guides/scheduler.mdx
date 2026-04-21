@@ -40,7 +40,7 @@ asyncio.run(scheduler.run())
   </TabItem>
   <TabItem label="Node">
 ```js
-const lit = require('@honker/node');
+const lit = require('@russellthehippo/honker-node');
 const db = lit.open('app.db');
 
 // honker_scheduler_add(name, queue, cron, payload, priority, expires)
@@ -122,7 +122,7 @@ sched.run
   </TabItem>
   <TabItem label="Bun">
 ```ts
-import { open, Scheduler } from "honker-bun";
+import { open, Scheduler } from "@russellthehippo/honker-bun";
 
 const db = open("app.db", "./libhonker_ext.dylib");
 const sched = new Scheduler(db);

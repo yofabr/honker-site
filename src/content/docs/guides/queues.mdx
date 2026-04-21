@@ -27,7 +27,7 @@ q.enqueue({"to": "timely@example.com"}, expires=3600) # drops out after 1h
   </TabItem>
   <TabItem label="Node">
 ```js
-const lit = require('@honker/node');
+const lit = require('@russellthehippo/honker-node');
 const db = lit.open('app.db');
 
 // One-time: install the schema. honker.open bootstraps for you,
@@ -96,7 +96,7 @@ q.enqueue({to: "urgent@example.com"}, priority: 10)
   </TabItem>
   <TabItem label="Bun">
 ```ts
-import { open } from "honker-bun";
+import { open } from "@russellthehippo/honker-bun";
 
 const db = open("app.db", "./libhonker_ext.dylib");
 const q = db.queue("emails");

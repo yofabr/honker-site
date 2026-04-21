@@ -17,7 +17,7 @@ Requires Python 3.11+. The wheel bundles the Rust cdylib so you don't need a sep
   </TabItem>
   <TabItem label="Node">
 ```bash
-npm install @honker/node
+npm install @russellthehippo/honker-node
 ```
 
 Requires Node 18+. The `.node` native binary is built per-platform by the release workflow. No separate extension download needed on supported targets (macOS arm64/x86_64, Linux x86_64/aarch64, Windows x86_64).
@@ -53,7 +53,7 @@ Requires Ruby 3.2+. Uses the `sqlite3` gem under the hood. As with Go, Ruby poin
   </TabItem>
   <TabItem label="Bun">
 ```bash
-bun add honker-bun
+bun add @russellthehippo/honker-bun
 ```
 
 Requires Bun 1.1+. Uses `bun:sqlite` and loads the extension from `./libhonker_ext.{dylib,so}`. Prebuilt extension binaries are attached to each GitHub release.
@@ -107,7 +107,7 @@ job.ack()
   </TabItem>
   <TabItem label="Node">
 ```js
-const lit = require('@honker/node');
+const lit = require('@russellthehippo/honker-node');
 const db = lit.open('app.db');
 
 const tx = db.transaction();
@@ -194,7 +194,7 @@ job.ack
   </TabItem>
   <TabItem label="Bun">
 ```ts
-import { open } from "honker-bun";
+import { open } from "@russellthehippo/honker-bun";
 
 const db = open("app.db", "./libhonker_ext.dylib");
 const q = db.queue("greetings");

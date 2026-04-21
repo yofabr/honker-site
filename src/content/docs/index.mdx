@@ -67,7 +67,7 @@ print(r.get(timeout=10))                    # blocks until worker runs it
   </TabItem>
   <TabItem label="Node">
 ```js
-const lit = require('@honker/node');
+const lit = require('@russellthehippo/honker-node');
 const db = lit.open('app.db');
 
 const tx = db.transaction();
@@ -159,7 +159,7 @@ end
   </TabItem>
   <TabItem label="Bun">
 ```ts
-import { open } from "honker-bun";
+import { open } from "@russellthehippo/honker-bun";
 
 const db = open("app.db", "./libhonker_ext.dylib");
 const q = db.queue("emails");
@@ -233,7 +233,7 @@ pip install honker
   </TabItem>
   <TabItem label="Node">
 ```bash
-npm install @honker/node
+npm install @russellthehippo/honker-node
 ```
   </TabItem>
   <TabItem label="Rust">
@@ -253,7 +253,7 @@ gem install honker
   </TabItem>
   <TabItem label="Bun">
 ```bash
-bun add honker-bun
+bun add @russellthehippo/honker-bun
 ```
   </TabItem>
   <TabItem label="Elixir">

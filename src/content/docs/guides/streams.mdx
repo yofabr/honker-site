@@ -29,7 +29,7 @@ with db.transaction() as tx:
   </TabItem>
   <TabItem label="Node">
 ```js
-const lit = require('@honker/node');
+const lit = require('@russellthehippo/honker-node');
 const db = lit.open('app.db');
 
 // honker_stream_publish(topic, payload_json) returns the new offset.
@@ -75,7 +75,7 @@ s.publish({id: 42, amount: 9900})
   </TabItem>
   <TabItem label="Bun">
 ```ts
-import { open } from "honker-bun";
+import { open } from "@russellthehippo/honker-bun";
 
 const db = open("app.db", "./libhonker_ext.dylib");
 const s = db.stream("orders");
