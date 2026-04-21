@@ -32,6 +32,8 @@ honker takes the approach that if SQLite is the primary datastore, the queue sho
 
 ## One example
 
+Enqueue atomically with a business write, then consume. Same `.db` file, same on-disk format, seven languages.
+
 <Tabs syncKey="language">
   <TabItem label="Python">
 ```python
@@ -40,12 +42,12 @@ import honker
 db = honker.open("app.db")
 q = db.queue("emails")
 
-# Enqueue atomically with the business write — one SQLite transaction.
+# Enqueue in the same transaction as the business write.
 with db.transaction() as tx:
     tx.execute("INSERT INTO orders (id, total) VALUES (?, ?)", [42, 99])
     q.enqueue({"to": "alice@example.com", "order_id": 42}, tx=tx)
 
-# Worker — wakes on WAL commit, no polling.
+# Worker wakes on WAL commit, no polling.
 async for job in q.claim("worker-1"):
     await send_email(job.payload)
     job.ack()
@@ -65,25 +67,144 @@ print(r.get(timeout=10))                    # blocks until worker runs it
   </TabItem>
   <TabItem label="Node">
 ```js
-import * as honker from '@honker/node';
-
-const db = honker.open('app.db');
+const lit = require('@honker/node');
+const db = lit.open('app.db');
 
 const tx = db.transaction();
-tx.execute('INSERT INTO orders (id, total) VALUES (?, ?)', [42, 99]);
+tx.query("SELECT honker_bootstrap()");
+tx.query(
+  "INSERT INTO orders (id, total) VALUES (?, ?)", [42, 99],
+);
 tx.query(
   "SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?)",
-  ['emails', JSON.stringify({ to: 'alice@example.com' }), null, null, 0, 3, null],
+  ['emails', JSON.stringify({ to: 'alice@example.com', order_id: 42 }),
+   null, null, 0, 3, null],
 );
 tx.commit();
+
+// Claim + ack
+const ctx = db.transaction();
+const jobs = JSON.parse(
+  ctx.query(
+    "SELECT honker_claim_batch(?, ?, ?, ?) AS j",
+    ['emails', 'worker-1', 1, 300],
+  )[0].j,
+);
+ctx.commit();
 ```
   </TabItem>
-  <TabItem label="SQL (any language)">
+  <TabItem label="Rust">
+```rust
+use honker::{Database, QueueOpts, EnqueueOpts};
+use serde_json::json;
+
+let db = Database::open("app.db")?;
+let q = db.queue("emails", QueueOpts::default());
+
+let tx = db.transaction()?;
+tx.execute("INSERT INTO orders (id, total) VALUES (?, ?)",
+           rusqlite::params![42, 99])?;
+q.enqueue_tx(&tx,
+    &json!({"to": "alice@example.com", "order_id": 42}),
+    EnqueueOpts::default())?;
+tx.commit()?;
+
+if let Some(job) = q.claim_one("worker-1")? {
+    send_email(&job.payload)?;
+    job.ack()?;
+}
+```
+  </TabItem>
+  <TabItem label="Go">
+```go
+import honker "github.com/russellromney/honker-go"
+
+db, _ := honker.Open("app.db", "./libhonker_ext.dylib")
+defer db.Close()
+
+q := db.Queue("emails", honker.QueueOptions{})
+
+tx, _ := db.Begin()
+tx.Exec("INSERT INTO orders (id, total) VALUES (?, ?)", 42, 99)
+q.EnqueueTx(tx, map[string]any{
+    "to": "alice@example.com", "order_id": 42,
+}, honker.EnqueueOptions{})
+tx.Commit()
+
+if job, _ := q.ClaimOne("worker-1"); job != nil {
+    var p map[string]any
+    job.UnmarshalPayload(&p)
+    sendEmail(p)
+    job.Ack()
+}
+```
+  </TabItem>
+  <TabItem label="Ruby">
+```ruby
+require "honker"
+
+db = Honker::Database.new("app.db", extension_path: "./libhonker_ext.dylib")
+q = db.queue("emails")
+
+db.transaction do |tx|
+  tx.execute("INSERT INTO orders (id, total) VALUES (?, ?)", [42, 99])
+  q.enqueue({to: "alice@example.com", order_id: 42}, tx: tx)
+end
+
+if (job = q.claim_one("worker-1"))
+  send_email(job.payload)
+  job.ack
+end
+```
+  </TabItem>
+  <TabItem label="Bun">
+```ts
+import { open } from "honker-bun";
+
+const db = open("app.db", "./libhonker_ext.dylib");
+const q = db.queue("emails");
+
+const tx = db.transaction();
+tx.execute("INSERT INTO orders (id, total) VALUES (?, ?)", [42, 99]);
+q.enqueue({ to: "alice@example.com", order_id: 42 }, { tx });
+tx.commit();
+
+const job = q.claimOne("worker-1");
+if (job) {
+  await sendEmail(job.payload as { to: string });
+  job.ack();
+}
+```
+  </TabItem>
+  <TabItem label="Elixir">
+```elixir
+{:ok, db} = Honker.open("app.db", extension_path: "./libhonker_ext.dylib")
+q = Honker.queue(db, "emails")
+
+Honker.transaction(db, fn tx ->
+  Honker.execute(tx, "INSERT INTO orders (id, total) VALUES (?, ?)", [42, 99])
+  Honker.Queue.enqueue(q, %{to: "alice@example.com", order_id: 42}, tx: tx)
+end)
+
+case Honker.Queue.claim_one(q, "worker-1") do
+  {:ok, nil} -> :ok
+  {:ok, job} ->
+    send_email(job.payload)
+    Honker.Job.ack(db, job)
+end
+```
+  </TabItem>
+  <TabItem label="SQL (extension)">
 ```sql
 .load ./libhonker_ext
 SELECT honker_bootstrap();
 
-SELECT honker_enqueue('emails', '{"to":"alice"}', NULL, NULL, 0, 3, NULL);
+BEGIN;
+INSERT INTO orders (id, total) VALUES (42, 99);
+SELECT honker_enqueue('emails', '{"to":"alice","order_id":42}',
+                      NULL, NULL, 0, 3, NULL);
+COMMIT;
+
 SELECT honker_claim_batch('emails', 'worker-1', 32, 300);
 SELECT honker_ack_batch('[1,2,3]', 'worker-1');
 ```
@@ -128,6 +249,11 @@ go get github.com/russellromney/honker-go
   <TabItem label="Ruby">
 ```bash
 gem install honker
+```
+  </TabItem>
+  <TabItem label="Bun">
+```bash
+bun add honker-bun
 ```
   </TabItem>
   <TabItem label="Elixir">
