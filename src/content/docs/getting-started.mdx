@@ -72,6 +72,13 @@ mix deps.get
 
 Requires Elixir 1.15+ and Erlang/OTP 26+. Uses `exqlite` for the SQLite FFI and loads the extension from a configured path.
   </TabItem>
+  <TabItem label=".NET / C#">
+```bash
+dotnet add package Honker
+```
+
+Targets `net8.0` and `net10.0`. The NuGet package bundles the native extension for `linux-x64`, `osx-x64`, `osx-arm64`, and `win-x64`. Override native loading with `OpenOptions.ExtensionPath` or `HONKER_EXTENSION_PATH` if you need an explicit path.
+  </TabItem>
   <TabItem label="C++">
 ```bash
 git clone https://github.com/russellromney/honker-cpp.git
@@ -207,6 +214,20 @@ IO.puts("hello, #{job.payload["name"]}!")
 Honker.Job.ack(db, job)
 ```
   </TabItem>
+  <TabItem label=".NET / C#">
+```csharp
+using Honker;
+
+using var db = Database.Open("app.db");
+var q = db.Queue("greetings");
+
+q.Enqueue(new { name = "world" });
+
+var job = q.ClaimOne("worker-1");
+Console.WriteLine($"hello, {job!.Payload.GetProperty("name").GetString()}!");
+job.Ack();
+```
+  </TabItem>
 </Tabs>
 
 ## A proper worker
@@ -316,6 +337,27 @@ end
 loop.(loop)
 ```
   </TabItem>
+  <TabItem label=".NET / C#">
+```csharp
+using Honker;
+
+using var db = Database.Open("app.db");
+var q = db.Queue("emails");
+
+await foreach (var job in q.ClaimAsync("worker-1"))
+{
+    try
+    {
+        await SendEmail(job.Payload);
+        job.Ack();
+    }
+    catch (Exception e)
+    {
+        job.Retry(60, e.Message);
+    }
+}
+```
+  </TabItem>
 </Tabs>
 
 ## Atomic enqueue with business writes
@@ -403,6 +445,18 @@ Honker.transaction(db, fn tx ->
     [42, 9900, "alice"])
   Honker.Queue.enqueue(q, %{order_id: 42, email_type: "confirmation"}, tx: tx)
 end)
+```
+  </TabItem>
+  <TabItem label=".NET / C#">
+```csharp
+using (var tx = db.BeginTransaction())
+{
+    tx.Execute(
+        "INSERT INTO orders (id, total, customer_id) VALUES (@p0, @p1, @p2)",
+        42, 9900, "alice");
+    q.Enqueue(new { order_id = 42, email_type = "confirmation" }, transaction: tx);
+    tx.Commit();
+}
 ```
   </TabItem>
 </Tabs>
