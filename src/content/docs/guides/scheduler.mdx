@@ -150,6 +150,37 @@ Honker.Scheduler.add(db,
 Honker.Scheduler.run(db)
 ```
   </TabItem>
+  <TabItem label="C++">
+```cpp
+#include "honker.hpp"
+
+#include <atomic>
+
+int main() {
+    honker::Database db{"app.db", "./libhonker_ext.dylib"};
+    auto sched = db.scheduler();
+
+    sched.add(
+        "nightly-backup",
+        "backups",
+        "0 3 * * *",
+        R"({"target":"s3"})",
+        0,
+        3600
+    );
+
+    sched.add(
+        "heartbeat",
+        "health",
+        "@every 1s",
+        R"({"ok":true})"
+    );
+
+    std::atomic<bool> stop{false};
+    sched.run(stop, "host-a");
+}
+```
+  </TabItem>
   <TabItem label="SQL (extension)">
 ```sql
 .load ./libhonker_ext
