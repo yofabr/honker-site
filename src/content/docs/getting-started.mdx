@@ -72,7 +72,7 @@ mix deps.get
 
 Requires Elixir 1.15+ and Erlang/OTP 26+. Uses `exqlite` for the SQLite FFI and loads the extension from a configured path.
   </TabItem>
-  <TabItem label=".NET / C#">
+  <TabItem label=".NET">
 ```bash
 dotnet add package Honker
 ```
@@ -214,7 +214,7 @@ IO.puts("hello, #{job.payload["name"]}!")
 Honker.Job.ack(db, job)
 ```
   </TabItem>
-  <TabItem label=".NET / C#">
+  <TabItem label=".NET">
 ```csharp
 using Honker;
 
@@ -337,7 +337,7 @@ end
 loop.(loop)
 ```
   </TabItem>
-  <TabItem label=".NET / C#">
+  <TabItem label=".NET">
 ```csharp
 using Honker;
 
@@ -447,7 +447,7 @@ Honker.transaction(db, fn tx ->
 end)
 ```
   </TabItem>
-  <TabItem label=".NET / C#">
+  <TabItem label=".NET">
 ```csharp
 using (var tx = db.BeginTransaction())
 {
