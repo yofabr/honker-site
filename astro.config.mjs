@@ -74,6 +74,7 @@ export default defineConfig({
           label: 'Reference',
           items: [
             { label: 'SQL functions (extension)', slug: 'reference/extension' },
+            { label: 'Watcher backends', slug: 'reference/watcher-backends' },
           ],
         },
       ],

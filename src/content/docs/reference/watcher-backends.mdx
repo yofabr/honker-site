@@ -1,0 +1,184 @@
+---
+title: Watcher backends
+description: How honker detects database changes — the default polling backend, two opt-in experimental alternatives, and the dead-man's switch contract every backend shares.
+---
+
+Honker wakes consumers on every database commit. By default, this happens via a 1 ms `PRAGMA data_version` poll on a single shared background thread per database. Two opt-in alternatives exist for advanced users — both **experimental**, both **source-only** (not in published wheels yet).
+
+Most users never need to change the backend. This page is for people who:
+
+- Care about idle CPU on a deployment with many honker'd databases.
+- Want to test event-driven wake on their platform before we ship it broadly.
+- Need to understand the dead-man's switch contract for a litestream / NFS / atomic-restore workflow.
+
+## TL;DR
+
+```python
+db = honker.open("app.db")                              # polling, the default
+db = honker.open("app.db", watcher_backend="kernel")    # experimental: OS file events
+db = honker.open("app.db", watcher_backend="shm")       # experimental: mmap WAL index, WAL only
+```
+
+```js
+const db = honker.open('app.db');
+const dbK = honker.open('app.db', undefined, 'kernel');
+const dbS = honker.open('app.db', undefined, 'shm');
+```
+
+```rust
+use honker_core::{SharedUpdateWatcher, WatcherBackend, WatcherConfig};
+
+let polling = SharedUpdateWatcher::new(db_path.clone());
+let kernel = SharedUpdateWatcher::new_with_config(
+    db_path.clone(),
+    WatcherConfig { backend: WatcherBackend::KernelWatch },
+);
+let shm = SharedUpdateWatcher::new_with_config(
+    db_path,
+    WatcherConfig { backend: WatcherBackend::ShmFastPath },
+);
+```
+
+The kernel and shm backends are gated behind Cargo features (`kernel-watcher`, `shm-fast-path`). Published wheels (`pip install honker`, `npm install`) build polling-only. To use the experimental backends today, build from source with the feature enabled — see [Source builds](#source-builds) below.
+
+## At a glance
+
+| backend | wake source | spurious wakes | missed wakes | journal mode | shipped in wheels |
+|---|---|---|---|---|---|
+| `polling` (default) | `PRAGMA data_version` every 1 ms | never | never | any | yes |
+| `kernel` | `notify-rs` events on db file + parent dir + `-wal`/`-shm`/`-journal` | possible | possible (if the OS drops events) | any | no — source only |
+| `shm` | mmap `iChange` in WAL index header every 1 ms | never | never (mmap inode-change → panic) | WAL only | no — source only |
+
+## When to choose which
+
+- **Stay on polling** unless you have a specific reason. It's the only backend with a strict-correctness contract (no spurious wakes, no missed wakes), it works in every journal mode, and it's the only one shipped in published wheels. The 3.5 ms/sec idle CPU cost is rounding error on any modern machine.
+- **Try kernel** if you're running many honker'd databases on one host and want to drive idle CPU near zero, or if you're on Linux and want lower wake latency than 1 ms polling can give. Accept that some wakes may be missed under OS event-coalescing pressure; consumers re-read state on wake so missed wakes mean delayed work, not lost work.
+- **Try shm** if you have a high-QPS WAL workload and the default 1 ms wake latency is your bottleneck (rare). Shm gives sub-microsecond wake detection but trusts the on-disk WAL index header layout.
+
+A useful rule of thumb: if you can't articulate a measurable benefit you're hoping to gain, stay on polling.
+
+## The backends in detail
+
+### Polling (default)
+
+A shared background thread runs `PRAGMA data_version` every millisecond on a read-only connection. The counter increments on every commit by any connection in any journal mode, and is visible across processes. ~3.5 µs per query, ~3.5 ms/sec total at 1 kHz; CPU cost is negligible. Listener count scales for free — one poll thread per database, not per subscriber.
+
+The polling backend tolerates transient `SQLITE_BUSY` / `SQLITE_LOCKED` (which happens when a writer holds an exclusive lock during commit on rollback-journal modes) — it skips the tick and retries next pass instead of dropping the connection. This means non-WAL workloads get reliable wake delivery during writer-locked windows.
+
+### Kernel
+
+Wakes on filesystem events from the OS (inotify on Linux, kqueue on macOS, ReadDirectoryChangesW on Windows). Watches the db file, the parent directory, and `-wal`/`-shm`/`-journal` sidecars when present.
+
+**Tradeoffs vs polling:**
+- Lower idle CPU (no 1 ms tick — wakes only when something changes on disk).
+- Lower wake latency on Linux/macOS for WAL (typically sub-millisecond).
+- **Spurious wakes possible.** Any file change in the directory wakes consumers. They re-read state from SQLite anyway, so this is wasted work, not incorrect.
+- **Missed wakes possible.** If the OS drops or coalesces an event, that commit's wake doesn't fire. The 5 s `idle_poll_s` paranoia poll is the only backstop.
+- macOS kqueue can't reliably observe in-place writes for non-WAL journal modes (TRUNCATE / PERSIST in particular). WAL works. The kernel backend is most useful in WAL mode.
+
+### Shm fast path
+
+Reads `iChange` at byte offset 8 of the WAL index header (`-shm` file) via mmap. `iChange` is a SQLite-internal counter that tracks WAL writes. Compared every millisecond against the previous value; wake fires on change.
+
+**Tradeoffs vs polling:**
+- Sub-microsecond wake detection (memory load vs SQLite query).
+- Same low latency under heavy QPS.
+- **WAL only.** No `-shm` exists in DELETE / TRUNCATE / PERSIST; shm refuses to start in those modes (`probe()` raises at `open()`).
+- **Trusts the on-disk shm layout.** If a future SQLite version changes the WAL index header layout, this could read stale data. Verified against current SQLite via the equivalence test.
+
+## Dead-man's switch (all three backends)
+
+Every backend snapshots the db file's `(dev, ino)` at startup and re-checks every 100 ms. If the inode changes — atomic rename, litestream restore, NFS volume remount, VACUUM — the watcher panics with a clear message:
+
+```
+honker: database file replaced: expected (dev=X, ino=Y), found (dev=X, ino=Z)
+at "/path/to/app.db". The watcher cannot recover; close the Database
+and reopen with honker.open().
+```
+
+The shm backend additionally panics on `-shm` inode change (recreated `-shm` would leave the mmap on a dead inode).
+
+When the watcher panics, every active subscriber's wake channel goes `Disconnected`. Consumers learn programmatically:
+
+- **Rust:** `update_events().recv()` returns `Err(RecvError)`.
+- **Python:** `await events.__anext__()` raises `RuntimeError("honker: update watcher died (database file likely replaced; recreate honker.open() to recover)")`.
+- **Node:** `await events.next()` rejects with the same message.
+
+Not a silent hang, not just an `eprintln` to stderr you may never see.
+
+### Recovery pattern
+
+```python
+import honker
+
+async def main():
+    db = honker.open("app.db")
+    while True:
+        try:
+            async for _ in db.update_events():
+                # ... do work ...
+                pass
+        except RuntimeError as e:
+            if "watcher died" not in str(e):
+                raise
+            db.close()
+            db = honker.open("app.db")  # fresh handle, fresh watcher, fresh baseline
+```
+
+```js
+async function consume() {
+  let db = honker.open('app.db');
+  while (true) {
+    try {
+      const events = db.updateEvents();
+      while (true) {
+        await events.next();
+        // ... do work ...
+      }
+    } catch (e) {
+      if (!String(e.message).includes('watcher died')) throw e;
+      db.close();
+      db = honker.open('app.db');
+    }
+  }
+}
+```
+
+For litestream-style restore: a successful restore atomically replaces the db file, which looks identical to any other replacement and trips the dead-man's switch. Recreate the Database after restore. The `Disconnected` / `RuntimeError` signal tells you when.
+
+## Synchronous baseline
+
+`update_events()` blocks until the watcher thread has captured its baseline (initial inode, initial `iChange`, etc.) before returning. Callers can mutate the file immediately after `update_events()` without racing the snapshot — useful in tests and recovery paths.
+
+The cost is microseconds (one `Connection::open` + one `stat` + a sync_channel handshake), one-time per `update_events()` call.
+
+## Source builds
+
+```bash
+# Python (maturin)
+cd packages/honker
+maturin develop --release --features kernel-watcher,shm-fast-path
+
+# Rust (Cargo dependency)
+[dependencies]
+honker-core = { version = "...", features = ["kernel-watcher", "shm-fast-path"] }
+
+# Node (napi-rs)
+cd packages/honker-node
+CARGO_BUILD_FEATURES=kernel-watcher,shm-fast-path npm run build
+```
+
+If the requested backend can't initialize at runtime (shm needs WAL + an open connection; kernel needs the OS notify API), `honker.open()` raises immediately. If you ask for a backend whose Cargo feature isn't compiled into your binary (the published-wheels case), it falls back to polling and logs once to stderr. There's no silent swap either way.
+
+## What's not characterized yet
+
+We've tested the headline contracts (per-backend wake correctness across journal modes, latency, file-replacement panic, cross-binding death propagation). The long tail of edge cases is the next phase of work — [Phase Atlas in the ROADMAP](https://github.com/russellromney/honker/blob/main/ROADMAP.md):
+
+- Rollback wake counts per backend
+- VACUUM behavior (all three should panic)
+- External non-SQLite writes
+- Multiple databases in the same directory (kernel cross-pollination)
+- NFS / SMB / FUSE detection in `probe()`
+- Symlinks, fork-without-exec, system suspend
+
+If you hit one of these in production, file an issue with the scenario; it sharpens the characterization work.

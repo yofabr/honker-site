@@ -244,6 +244,8 @@ honker polls SQLite's `PRAGMA data_version` every millisecond. That's a monotoni
 
 Idle cost is that one lightweight SELECT per millisecond per database — no page-cache pressure, no writer-lock contention, no kernel file watcher in the mix. Listener count scales for free because the wake signal is one shared poll, not one query per listener.
 
+Advanced users can opt into experimental kernel filesystem-event or mmap WAL-index backends; see [Watcher backends](/reference/watcher-backends/).
+
 The queue, stream, and pub/sub primitives are all INSERTs into tables managed by the extension. Calling `queue.enqueue(payload, tx=tx)` inside your business transaction means the job row is ACID with the `INSERT INTO orders` that preceded it. Rollback drops the job along with everything else.
 
 ## Prior art
