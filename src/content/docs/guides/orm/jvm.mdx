@@ -1,0 +1,164 @@
+---
+title: Java and Kotlin ORM integration
+description: Use Honker with JDBC, Hibernate/JPA, jOOQ, and Exposed by calling honker_* inside the ORM transaction.
+---
+
+Java and Kotlin apps have two good Honker shapes:
+
+- Use the JVM binding directly for workers, streams, listeners, tasks, locks, and rate limits.
+- When an ORM owns the write transaction, load the extension on that ORM connection and call `honker_*` SQL from inside the same transaction.
+
+That keeps the important guarantee simple: the business row and the queued job commit together or roll back together.
+
+## Load the extension on JDBC connections
+
+SQLite extension loading must be enabled before the connection opens. With `org.xerial:sqlite-jdbc`, configure that in the DataSource or connection properties.
+
+```java
+import org.sqlite.SQLiteConfig;
+
+var config = new SQLiteConfig();
+config.enableLoadExtension(true);
+
+var props = config.toProperties();
+try (var conn = java.sql.DriverManager.getConnection("jdbc:sqlite:app.db", props);
+     var stmt = conn.createStatement()) {
+    stmt.execute("SELECT load_extension('/absolute/path/to/libhonker_ext.dylib')");
+    stmt.execute("SELECT honker_bootstrap()");
+}
+```
+
+In production, do this once in your connection initialization path or migration step. Honker's native `dev.honker:honker` runtime handles this for its own connections, but ORM-owned connections still need their own load hook.
+
+## A tiny enqueue helper
+
+Keep the wrapper in your app. It is small, obvious, and tied to your transaction type.
+
+```java
+import java.sql.Connection;
+
+public final class HonkerSql {
+    private HonkerSql() {}
+
+    public static long enqueue(Connection conn, String queue, String payloadJson) throws Exception {
+        try (var stmt = conn.prepareStatement(
+            "SELECT honker_enqueue(?, ?, NULL, NULL, 0, 3, NULL) AS id")) {
+            stmt.setString(1, queue);
+            stmt.setString(2, payloadJson);
+            try (var rs = stmt.executeQuery()) {
+                rs.next();
+                return rs.getLong("id");
+            }
+        }
+    }
+}
+```
+
+## Hibernate / JPA
+
+Use the ORM for your domain write, then unwrap the JDBC connection inside the same transaction.
+
+```java
+import org.hibernate.Session;
+
+entityManager.getTransaction().begin();
+try {
+    entityManager.persist(new Order(42L, "alice"));
+
+    entityManager.unwrap(Session.class).doWork(conn -> {
+        HonkerSql.enqueue(
+            conn,
+            "emails",
+            "{\"order_id\":42,\"email_type\":\"confirmation\"}"
+        );
+    });
+
+    entityManager.getTransaction().commit();
+} catch (RuntimeException e) {
+    entityManager.getTransaction().rollback();
+    throw e;
+}
+```
+
+Run workers with the JVM binding against the same file:
+
+```java
+import dev.honker.Honker;
+
+try (var db = Honker.open("app.db")) {
+    var q = db.queue("emails");
+    try (var worker = q.worker("worker-1", job -> sendEmail(job.payloadJson()))) {
+        Thread.currentThread().join();
+    }
+}
+```
+
+## jOOQ
+
+jOOQ's transaction callback already gives you the correct transaction-scoped configuration.
+
+```java
+import static org.jooq.impl.DSL.using;
+
+ctx.transaction(configuration -> {
+    var tx = using(configuration);
+
+    tx.insertInto(ORDERS)
+        .set(ORDERS.ID, 42L)
+        .set(ORDERS.CUSTOMER_ID, "alice")
+        .execute();
+
+    tx.fetchValue(
+        "SELECT honker_enqueue(?, ?, NULL, NULL, 0, 3, NULL)",
+        "emails",
+        "{\"order_id\":42,\"email_type\":\"confirmation\"}"
+    );
+});
+```
+
+## Kotlin Exposed
+
+Exposed can call raw SQL inside `transaction { ... }`. Keep the helper boring.
+
+```kotlin
+import org.jetbrains.exposed.sql.transactions.transaction
+
+transaction {
+    Orders.insert {
+        it[id] = 42
+        it[customerId] = "alice"
+    }
+
+    exec(
+        """
+        SELECT honker_enqueue(
+          'emails',
+          '{"order_id":42,"email_type":"confirmation"}',
+          NULL, NULL, 0, 3, NULL
+        )
+        """.trimIndent()
+    )
+}
+```
+
+For workers, Kotlin can use the coroutine wrapper over the Java runtime:
+
+```kotlin
+import dev.honker.kotlin.asFlow
+import dev.honker.kotlin.honker
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.runBlocking
+
+runBlocking {
+    honker("app.db").use { db ->
+        db.queue("emails").asFlow("worker-1").collect { job ->
+            sendEmail(job.payloadJson())
+            job.ack()
+        }
+    }
+}
+```
+
+## Test it like production
+
+Use a temporary file-backed database, not `:memory:`. Open one ORM connection for the write path and one Honker JVM/Kotlin worker connection for the read path. Commit an ORM transaction that inserts a business row and calls `honker_enqueue`, then assert the worker claims exactly that payload from the same `.db` file.

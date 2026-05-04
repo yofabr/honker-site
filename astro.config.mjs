@@ -78,6 +78,7 @@ export default defineConfig({
                 { label: 'Ruby', slug: 'guides/orm/ruby' },
                 { label: 'Elixir', slug: 'guides/orm/elixir' },
                 { label: '.NET / C#', slug: 'guides/orm/dotnet' },
+                { label: 'Java / Kotlin', slug: 'guides/orm/jvm' },
                 { label: 'C++', slug: 'guides/orm/cpp' },
               ],
             },

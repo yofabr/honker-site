@@ -79,6 +79,30 @@ dotnet add package Honker
 
 Targets `net8.0` and `net10.0`. The NuGet package bundles the native extension for `linux-x64`, `osx-x64`, `osx-arm64`, and `win-x64`. Override native loading with `OpenOptions.ExtensionPath` or `HONKER_EXTENSION_PATH` if you need an explicit path.
   </TabItem>
+  <TabItem label="Java">
+```xml
+<!-- pom.xml -->
+<dependency>
+  <groupId>dev.honker</groupId>
+  <artifactId>honker</artifactId>
+  <version>0.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+Requires Java 17+. The JVM binding uses `org.xerial:sqlite-jdbc` and bundles the native Honker extension in the Maven artifact. Override native loading with `OpenOptions.extensionPath(...)` or `HONKER_EXTENSION_PATH` when you want to point at a local build.
+  </TabItem>
+  <TabItem label="Kotlin">
+```xml
+<!-- pom.xml -->
+<dependency>
+  <groupId>dev.honker</groupId>
+  <artifactId>honker-kotlin</artifactId>
+  <version>0.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+Requires Kotlin 2.2+ and Java 17+. The Kotlin artifact layers coroutine `Flow` helpers, builder DSLs, and typed convenience extensions on top of the Java runtime.
+  </TabItem>
   <TabItem label="C++">
 ```bash
 git clone https://github.com/russellromney/honker-cpp.git
@@ -226,6 +250,36 @@ q.Enqueue(new { name = "world" });
 var job = q.ClaimOne("worker-1");
 Console.WriteLine($"hello, {job!.Payload.GetProperty("name").GetString()}!");
 job.Ack();
+```
+  </TabItem>
+  <TabItem label="Java">
+```java
+import dev.honker.Honker;
+
+try (var db = Honker.open("app.db")) {
+    var q = db.queue("greetings");
+
+    q.enqueue("{\"name\":\"world\"}");
+
+    var job = q.claimOne("worker-1").orElseThrow();
+    System.out.println("claimed " + job.payloadJson());
+    job.ack();
+}
+```
+  </TabItem>
+  <TabItem label="Kotlin">
+```kotlin
+import dev.honker.kotlin.honker
+
+honker("app.db").use { db ->
+    val q = db.queue("greetings")
+
+    q.enqueueJson("""{"name":"world"}""")
+
+    val job = q.claimOne("worker-1").orElseThrow()
+    println("claimed ${job.payloadJson()}")
+    job.ack()
+}
 ```
   </TabItem>
   <TabItem label="C++">
@@ -391,6 +445,52 @@ await foreach (var job in q.ClaimAsync("worker-1"))
 }
 ```
   </TabItem>
+  <TabItem label="Java">
+```java
+import dev.honker.Honker;
+import dev.honker.RetryableException;
+
+import java.time.Duration;
+
+try (var db = Honker.open("app.db")) {
+    var q = db.queue("emails");
+
+    try (var worker = q.worker("worker-1", job -> {
+        try {
+            sendEmail(job.payloadJson());
+        } catch (Exception e) {
+            throw new RetryableException(e.getMessage(), Duration.ofSeconds(60));
+        }
+    })) {
+        Thread.currentThread().join();
+    }
+}
+```
+  </TabItem>
+  <TabItem label="Kotlin">
+```kotlin
+import dev.honker.kotlin.asFlow
+import dev.honker.kotlin.honker
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.runBlocking
+import java.time.Duration
+
+runBlocking {
+    honker("app.db").use { db ->
+        val q = db.queue("emails")
+
+        q.asFlow("worker-1").collect { job ->
+            try {
+                sendEmail(job.payloadJson())
+                job.ack()
+            } catch (e: Exception) {
+                job.retry(Duration.ofSeconds(60), e.message)
+            }
+        }
+    }
+}
+```
+  </TabItem>
   <TabItem label="C++">
 ```cpp
 #include "honker.hpp"
@@ -530,6 +630,28 @@ using (var tx = db.BeginTransaction())
         42, 9900, "alice");
     q.Enqueue(new { order_id = 42, email_type = "confirmation" }, transaction: tx);
     tx.Commit();
+}
+```
+  </TabItem>
+  <TabItem label="Java">
+```java
+db.transactionVoid(tx -> {
+    tx.execute(
+        "INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)",
+        java.util.List.of(42, 9900, "alice")
+    );
+    q.enqueue(tx, "{\"order_id\":42,\"email_type\":\"confirmation\"}");
+});
+```
+  </TabItem>
+  <TabItem label="Kotlin">
+```kotlin
+db.transactionVoid { tx ->
+    tx.execute(
+        "INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)",
+        listOf(42, 9900, "alice"),
+    )
+    q.enqueue(tx, """{"order_id":42,"email_type":"confirmation"}""")
 }
 ```
   </TabItem>
