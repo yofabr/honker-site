@@ -21,6 +21,8 @@ details, see the [language guides](/languages/).
 | Go | CI | yes | yes | notify yes, wait API | yes | yes | poll, kernel, shm |
 | Bun `@russellthehippo/honker-bun` | CI | yes | yes | yes | yes | yes | poll, kernel, shm |
 | C++ | CI | yes | yes | yes | yes | yes | poll, kernel, shm |
+| Java `dev.honker:honker` | CI | yes | yes | yes | yes | yes | poll, kernel, shm |
+| Kotlin `dev.honker:honker-kotlin` | CI | yes | yes | yes | yes | yes | poll, kernel, shm |
 | Ruby `honker` | yes | yes | yes | notify yes, wait API | yes | yes | poll, kernel, shm |
 | Elixir `honker` | CI | yes | yes | notify yes, wait API | yes | yes | poll, kernel, shm |
 
@@ -30,8 +32,9 @@ details, see the [language guides](/languages/).
 - PR CI runs Python on Linux, macOS, and Windows.
 - PR CI runs Node on Linux, macOS, and Windows.
 - PR CI runs .NET on Linux, macOS, and Windows.
+- PR CI runs Java and Kotlin package tests on Linux, macOS, and Windows.
 - The aggregate Linux binding smoke runs Rust wrapper, Go, .NET
-  Python interop, C++, Bun, Ruby, Elixir, and Ruby/Python interop.
+  Python interop, C++, Bun, Ruby, Elixir, Java/Kotlin, and Ruby/Python interop.
 - The packaged-install proof workflow builds and installs Python,
   Node, Ruby, and .NET packages into clean throwaway consumers.
 - Watcher-backend queue proofs run cross-process for every binding so
@@ -48,4 +51,4 @@ details, see the [language guides](/languages/).
 - Long soak on every OS. The scary nightly workflow soaks Linux; PR CI
   stays shorter.
 - Go, Ruby, and Elixir expose notifications and update-waiting without
-  the same high-level async listener shape as Python/Node/.NET/Rust/Bun/C++.
+  the same high-level async listener shape as Python/Node/.NET/Rust/Bun/C++/JVM.

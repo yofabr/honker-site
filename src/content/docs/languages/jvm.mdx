@@ -1,0 +1,142 @@
+---
+title: Java / Kotlin
+description: Use Honker from the JVM, including Maven install, Kotlin Flow helpers, watcher backends, queues, transactional outbox, and ORM notes.
+---
+
+## Install
+
+Java:
+
+```xml
+<dependency>
+  <groupId>dev.honker</groupId>
+  <artifactId>honker</artifactId>
+  <version>0.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+Kotlin:
+
+```xml
+<dependency>
+  <groupId>dev.honker</groupId>
+  <artifactId>honker-kotlin</artifactId>
+  <version>0.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+The Java artifact is the runtime binding. The Kotlin artifact adds builder DSLs,
+typed extension helpers, coroutine `Flow` wrappers, and suspending task-result
+helpers over that same runtime.
+
+## Open
+
+Java:
+
+```java
+import dev.honker.Honker;
+import dev.honker.OpenOptions;
+import dev.honker.WatcherBackend;
+import dev.honker.WatcherOptions;
+
+var options = OpenOptions.builder()
+    .watcherOptions(WatcherOptions.builder()
+        .backend(WatcherBackend.MMAP_SHM)
+        .build())
+    .build();
+
+try (var db = Honker.open("app.db", options)) {
+    // use db
+}
+```
+
+Kotlin:
+
+```kotlin
+import dev.honker.WatcherBackend
+import dev.honker.kotlin.honker
+import dev.honker.kotlin.openOptions
+import dev.honker.kotlin.watcherOptions
+
+honker("app.db", openOptions {
+    watcherOptions(watcherOptions {
+        backend(WatcherBackend.MMAP_SHM)
+    })
+}).use { db ->
+    // use db
+}
+```
+
+`WatcherBackend.AUTO` and `PRAGMA_DATA_VERSION` use the stable pragma watcher.
+`MMAP_SHM` and `KERNEL_EVENTS` are explicit experimental backends; if they cannot
+initialize, opening the database fails instead of silently falling back.
+
+## Queue
+
+```java
+try (var db = Honker.open("app.db")) {
+    var q = db.queue("emails");
+    q.enqueue("{\"to\":\"alice@example.com\",\"order_id\":42}");
+
+    var job = q.claimOne("worker-1").orElseThrow();
+    sendEmail(job.payloadJson());
+    job.ack();
+}
+```
+
+Kotlin can consume jobs as a coroutine flow:
+
+```kotlin
+import dev.honker.kotlin.asFlow
+import dev.honker.kotlin.honker
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.runBlocking
+
+runBlocking {
+    honker("app.db").use { db ->
+        db.queue("emails").asFlow("worker-1").collect { job ->
+            sendEmail(job.payloadJson())
+            job.ack()
+        }
+    }
+}
+```
+
+## Transactional Outbox
+
+```java
+try (var db = Honker.open("app.db")) {
+    var outbox = db.outbox("email", payloadJson -> sendEmail(payloadJson));
+
+    db.transactionVoid(tx -> {
+        tx.execute(
+            "INSERT INTO orders (id, total) VALUES (?, ?)",
+            java.util.List.of(42, 9900)
+        );
+        outbox.enqueue(tx, "{\"order_id\":42}");
+    });
+
+    try (var worker = outbox.runWorker("email-worker")) {
+        Thread.currentThread().join();
+    }
+}
+```
+
+Outbox jobs retry with exponential backoff when delivery throws.
+
+## ORM Section
+
+For JDBC, Hibernate/JPA, jOOQ, or Exposed, let the ORM own its transaction and
+call `honker_enqueue`, `notify`, or stream SQL on the same connection before
+commit. Run workers in a separate Java/Kotlin process with the Honker runtime
+against the same `.db` file.
+
+See the full [Java and Kotlin ORM recipe](/guides/orm/jvm/) for JDBC extension
+loading, Hibernate `Session#doWork`, jOOQ transactions, and Exposed examples.
+
+## Testing
+
+Use temporary file-backed databases and real JVM subprocess workers for watcher
+backend tests. That proves bundled native loading, SQLite reopen behavior,
+cross-process wake delivery, SHM reopen behavior, and explicit experimental
+backend failures in the same shape production uses.

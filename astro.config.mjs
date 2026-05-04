@@ -96,6 +96,7 @@ export default defineConfig({
             { label: 'Bun', slug: 'languages/bun' },
             { label: 'Elixir', slug: 'languages/elixir' },
             { label: '.NET / C#', slug: 'languages/dotnet' },
+            { label: 'Java / Kotlin', slug: 'languages/jvm' },
             { label: 'C++', slug: 'languages/cpp' },
           ],
         },
